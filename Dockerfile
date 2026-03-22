@@ -1,13 +1,12 @@
-# Use Node image
-FROM node:18
+FROM node:18-slim
 
-# Install required libraries
+# Install required system dependencies
 RUN apt-get update && apt-get install -y \
     chromium \
     libglib2.0-0 \
     libnss3 \
-    libatk-bridge2.0-0 \
     libatk1.0-0 \
+    libatk-bridge2.0-0 \
     libcups2 \
     libdrm2 \
     libxkbcommon0 \
@@ -24,16 +23,18 @@ RUN apt-get update && apt-get install -y \
     libx11-6 \
     ca-certificates \
     fonts-liberation \
-    wget
+    wget \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
 
-# Set working dir
 WORKDIR /app
 
-# Copy files
 COPY package*.json ./
 RUN npm install
 
 COPY . .
 
-# Start app
+# IMPORTANT: Tell Puppeteer to use system Chromium
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
 CMD ["node", "index.js"]

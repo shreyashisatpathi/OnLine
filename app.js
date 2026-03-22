@@ -1,15 +1,13 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+require('dotenv').config();
+
 const { createClient } = require('redis');
 
 const redis = createClient({
-    username: 'default',
-    password: 'hYAjyzANNi1fCL3XB6FMRtZUvFty5UTl',
-    socket: {
-        host: 'redis-19329.crce286.ap-south-1-1.ec2.cloud.redislabs.com',
-        port: 19329
-    }
+    url: process.env.REDIS_URL
 });
+
 redis.on('error', (err) => console.log('Redis Error:', err));
 
 (async () => {

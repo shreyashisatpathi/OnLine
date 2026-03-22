@@ -1,172 +1,192 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 require('dotenv').config();
+const qrcode = require('qrcode-terminal');
 
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { createClient } = require('redis');
-REDIS_URL='redis://default:hYAjyzANNi1fCL3XB6FMRtZUvFty5UTl@redis-19329.crce286.ap-south-1-1.ec2.cloud.redislabs.com:19329'
 
+// ✅ Redis (FIX: use env, not hardcoded)
 const redis = createClient({
-    url: REDIS_URL
+    url: process.env.REDIS_URL
 });
 
 redis.on('error', (err) => console.log('Redis Error:', err));
 
 (async () => {
     await redis.connect();
-    console.log('✅ Connected to Redis 123');
+    console.log('✅ Connected to Redis');
 })();
 
-// Queue state
+// Queue state (kept but mostly unused now)
 let queue = [];
-let currentToken = 1;
 let servingToken = null;
 
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
-});
+// ================= START BAILEYS =================
 
-client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
-});
+async function startBot() {
+    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+    const { version } = await fetchLatestBaileysVersion();
 
-client.on('ready', () => {
-    console.log('✅ WhatsApp Queue Bot is Ready!');
-});
+    const sock = makeWASocket({
+        version,
+        auth: state
+    });
 
-// Helper: check if user already in queue
-const findUser = (user) => {
-    return queue.find(q => q.user === user);
-};
+    sock.ev.on('connection.update', (update) => {
+        const { connection, qr } = update;
 
-const handleMessage = async (msg) => {
-    if (msg.fromMe) {
-        console.log("📤 From Me:", msg.body);
-    }
-    const text = msg.body.toLowerCase().trim();
-
-    const contact = await msg.getContact();
-
-    const user = {
-        id: msg.from,                
-        number: contact.number || "",
-        name: contact.pushname || "User"
-    };
-    console.log("Message:", text);
-
-    // ================ USER COMMANDS =================
-
-    // Join queue
-
-    if (text === 'hi') {
-        const contact = await msg.getContact();
-
-        const userId = msg.from;
-        const name = contact.pushname || "User";
-
-        // Check if already exists (FAST)
-        const exists = await redis.hExists('queue:users', userId);
-
-        if (exists) {
-            const data = JSON.parse(await redis.hGet('queue:users', userId));
-            return msg.reply(`⚠️ Already in queue. Token #${data.token}`);
+        if (qr) {
+            console.log("📱 Scan this QR:");
+            qrcode.generate(qr, { small: true });
         }
 
-        const token = await redis.incr('token:counter');
-
-        const userData = { id: userId, name, token };
-
-        // Save in both places
-        await redis.rPush('queue:list', JSON.stringify(userData));
-        await redis.hSet('queue:users', userId, JSON.stringify(userData));
-
-        return msg.reply(`🎫 Hi ${name}! Your token number is #${token}\nPeople ahead: ${queue.length - 1}`);
-    }
-    // Check status
-    if (text === 'status') {
-        const userId = msg.from;
-
-        const data = await redis.hGet('queue:users', userId);
-
-        if (!data) {
-            return msg.reply('❌ Not in queue');
+        if (connection === 'open') {
+            console.log('✅ WhatsApp Connected!');
         }
 
-        const user = JSON.parse(data);
-
-        const list = await redis.lRange('queue:list', 0, -1);
-        const index = list.findIndex(u => JSON.parse(u).id === userId);
-
-        return msg.reply(`📊 Token #${user.token}, Position ${index + 1}`);
-    }
-
-    // Exit queue
-    if (text === 'exit') {
-        const index = queue.findIndex(q => q.user === user);
-
-        if (index === -1) {
-            return msg.reply('❌ You are not in queue');
+        if (connection === 'close') {
+            console.log('❌ Connection closed, retrying...');
+            startBot(); // auto reconnect
         }
+    });
 
-        queue.splice(index, 1);
-        return msg.reply('✅ You have left the queue');
-    }
+    sock.ev.on('creds.update', saveCreds);
 
-    // ================= ADMIN COMMANDS =================
+    console.log('🚀 WhatsApp Queue Bot is Ready!');
 
-    // ⚠️ Replace with your number
+    // ================= MESSAGE HANDLER =================
 
-    if (user.number === process.env.ADMIN) {
-        // Call next token
-        if (text === 'next') {
-            const next = await redis.lPop('queue:list');
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0];
+        if (!msg.message) return;
 
-            if (!next) {
-                return msg.reply('🚫 Queue empty');
+        const sender = msg.key.remoteJid;
+
+        const text =
+            msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            "";
+
+        const input = text.toLowerCase().trim();
+
+        console.log("📩", sender, input);
+
+        // Fake contact (Baileys doesn’t give full contact easily)
+        const user = {
+            id: sender,
+            number: sender.split('@')[0],
+            name: "User"
+        };
+
+        // ================= USER COMMANDS =================
+
+        if (input === 'hi') {
+            const userId = sender;
+            const name = user.name;
+
+            const exists = await redis.hExists('queue:users', userId);
+
+            if (exists) {
+                const data = JSON.parse(await redis.hGet('queue:users', userId));
+                return sock.sendMessage(sender, {
+                    text: `⚠️ Already in queue. Token #${data.token}`
+                });
             }
 
-            const user = JSON.parse(next);
+            const token = await redis.incr('token:counter');
 
-            // ❗ Remove from hash too
-            await redis.hDel('queue:users', user.id);
+            const userData = { id: userId, name, token };
 
-            await client.sendMessage(
-                user.id,
-                `🔔 Your turn! Token #${user.token}`
-            );
+            await redis.rPush('queue:list', JSON.stringify(userData));
+            await redis.hSet('queue:users', userId, JSON.stringify(userData));
 
-            return msg.reply(`➡️ Serving token #${user.token}`);
+            return sock.sendMessage(sender, {
+                text: `🎫 Hi ${name}! Your token number is #${token}`
+            });
         }
 
-        // Current serving
-        if (text === 'current') {
-            return msg.reply(
-                servingToken
-                    ? `🎯 Currently serving #${servingToken}`
-                    : 'No active token'
-            );
+        if (input === 'status') {
+            const userId = sender;
+
+            const data = await redis.hGet('queue:users', userId);
+
+            if (!data) {
+                return sock.sendMessage(sender, {
+                    text: '❌ Not in queue'
+                });
+            }
+
+            const user = JSON.parse(data);
+
+            const list = await redis.lRange('queue:list', 0, -1);
+            const index = list.findIndex(u => JSON.parse(u).id === userId);
+
+            return sock.sendMessage(sender, {
+                text: `📊 Token #${user.token}, Position ${index + 1}`
+            });
         }
 
-        // Reset queue
-        if (text === 'reset') {
+        if (input === 'exit') {
+            // remove from redis list (simple version)
+            const list = await redis.lRange('queue:list', 0, -1);
+            const filtered = list.filter(u => JSON.parse(u).id !== sender);
+
             await redis.del('queue:list');
-            await redis.del('queue:users');
-            await redis.del('token:counter');
+            if (filtered.length > 0) {
+                await redis.rPush('queue:list', filtered);
+            }
 
-            return msg.reply('♻️ Queue reset');
+            await redis.hDel('queue:users', sender);
+
+            return sock.sendMessage(sender, {
+                text: '✅ You have left the queue'
+            });
         }
-    }
-};
 
-client.on('message', handleMessage);
-client.on('message_create', msg => {
-    if (msg.fromMe) handleMessage(msg);
-});
+        // ================= ADMIN =================
 
+        if (user.number === process.env.ADMIN) {
 
+            if (input === 'next') {
+                const next = await redis.lPop('queue:list');
 
-client.initialize();
+                if (!next) {
+                    return sock.sendMessage(sender, {
+                        text: '🚫 Queue empty'
+                    });
+                }
+
+                const user = JSON.parse(next);
+
+                await redis.hDel('queue:users', user.id);
+
+                await sock.sendMessage(user.id, {
+                    text: `🔔 Your turn! Token #${user.token}`
+                });
+
+                return sock.sendMessage(sender, {
+                    text: `➡️ Serving token #${user.token}`
+                });
+            }
+
+            if (input === 'current') {
+                return sock.sendMessage(sender, {
+                    text: servingToken
+                        ? `🎯 Currently serving #${servingToken}`
+                        : 'No active token'
+                });
+            }
+
+            if (input === 'reset') {
+                await redis.del('queue:list');
+                await redis.del('queue:users');
+                await redis.del('token:counter');
+
+                return sock.sendMessage(sender, {
+                    text: '♻️ Queue reset'
+                });
+            }
+        }
+    });
+}
+
+startBot();
